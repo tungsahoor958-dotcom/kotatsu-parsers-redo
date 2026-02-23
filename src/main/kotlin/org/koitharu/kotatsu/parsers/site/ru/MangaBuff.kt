@@ -376,6 +376,7 @@ internal class MangaBuff(context: MangaLoaderContext) :
 		val doc = webClient.httpGet("https://$domain/manga").parseHtml()
 
 		val tags = LinkedHashSet<MangaTag>()
+		// Use only numeric IDs from the real genres <select>.
 		doc.select("select[name='genres[]'] option, [name='genres[]'] option").forEach { option ->
 			val value = option.attr("value").trim()
 			val title = option.text().trim()
@@ -387,25 +388,6 @@ internal class MangaBuff(context: MangaLoaderContext) :
 						source = source,
 					),
 				)
-			}
-		}
-		if (tags.isEmpty()) {
-			// New filter UI uses simple-select; prefer value/data-value, then id.
-			doc.select(".ss-list .ss-option, .ss-option").forEach { option ->
-				val value = option.attrOrNull("value")?.trim().orEmpty()
-					.ifEmpty { option.attrOrNull("data-value")?.trim().orEmpty() }
-					.ifEmpty { option.id().trim() }
-					.ifEmpty { option.attrOrNull("data-id")?.trim().orEmpty() }
-				val title = option.text().trim()
-				if (value.isNotEmpty() && title.isNotEmpty()) {
-					tags.add(
-						MangaTag(
-							key = TAG_GENRE_PREFIX + value,
-							title = title,
-							source = source,
-						),
-					)
-				}
 			}
 		}
 		doc.select("select[name='tags[]'] option, [name='tags[]'] option").forEach { option ->
