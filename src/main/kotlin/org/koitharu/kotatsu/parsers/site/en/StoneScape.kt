@@ -138,18 +138,23 @@ internal class StoneScape(context: MangaLoaderContext) :
 			url = "/series/$slug",
 			publicUrl = "https://$domain/series/$slug",
 			coverUrl = resolveImageUrl(
-				series.optString("featuredImage")
+				series.optString("coverUrl")
+					.ifBlank { series.optString("featuredImage") }
 					.ifBlank { series.optString("cover") }
 					.ifBlank { manga.coverUrl.orEmpty() },
 			).nullIfEmpty() ?: manga.coverUrl,
-			largeCoverUrl = resolveImageUrl(series.optString("banner")).nullIfEmpty(),
+			largeCoverUrl = resolveImageUrl(
+				series.optString("bannerUrl")
+					.ifBlank { series.optString("banner") },
+			).nullIfEmpty(),
 			description = series.optString("postContent")
 				.ifBlank { series.optString("description") }
 				.nullIfEmpty(),
 			altTitles = parseAltTitles(series),
 			tags = parseGenres(series.optJSONArray("genres")),
 			state = parseStatus(
-				series.optString("seriesStatus")
+				series.optString("publicationStatus")
+					.ifBlank { series.optString("seriesStatus") }
 					.ifBlank { series.optString("status") },
 			),
 			authors = parseAuthors(series),
@@ -189,11 +194,15 @@ internal class StoneScape(context: MangaLoaderContext) :
 
 		return List(chapters.length()) { i ->
 			val chapter = chapters.getJSONObject(i)
+			val chapterNumber = chapter.optString("chapterNumber")
+				.ifBlank { chapter.optString("number") }
 			val chapterSlug = chapter.optString("slug").ifBlank {
-				"chapter-${chapter.opt("number") ?: i + 1}"
+				"chapter-${chapterNumber.ifBlank { (i + 1).toString() }}"
 			}
-			val url = "/series/$slug/$chapterSlug#${chapter.opt("id")}"
-			val number = chapter.optString("number").toFloatOrNull()
+			val chapterId = chapter.optString("chapterId")
+				.ifBlank { chapter.optString("id") }
+			val url = "/series/$slug/$chapterSlug#$chapterId"
+			val number = chapterNumber.toFloatOrNull()
 				?: chapter.optDouble("number", (i + 1).toDouble()).toFloat()
 			val title = chapter.optString("title").nullIfEmpty()
 			MangaChapter(
@@ -260,7 +269,8 @@ internal class StoneScape(context: MangaLoaderContext) :
 				.ifBlank { json.optString("title") }
 				.ifBlank { slug },
 			coverUrl = resolveImageUrl(
-				json.optString("featuredImage")
+				json.optString("coverUrl")
+					.ifBlank { json.optString("featuredImage") }
 					.ifBlank { json.optString("cover") },
 			).nullIfEmpty(),
 			altTitles = emptySet(),
@@ -268,7 +278,8 @@ internal class StoneScape(context: MangaLoaderContext) :
 			tags = parseGenres(json.optJSONArray("genres")),
 			description = null,
 			state = parseStatus(
-				json.optString("seriesStatus")
+				json.optString("publicationStatus")
+					.ifBlank { json.optString("seriesStatus") }
 					.ifBlank { json.optString("status") },
 			),
 			authors = emptySet(),
@@ -287,12 +298,20 @@ internal class StoneScape(context: MangaLoaderContext) :
 		if (array == null) return emptySet()
 		val result = LinkedHashSet<MangaTag>(array.length())
 		for (i in 0 until array.length()) {
-			val genre = array.optJSONObject(i) ?: continue
-			val title = genre.optString("name").nullIfEmpty() ?: continue
-			val key = genre.optString("slug")
-				.ifBlank { genre.opt("id")?.toString().orEmpty() }
-				.ifBlank { title.lowercase(sourceLocale).replace(' ', '-') }
-			result += MangaTag(key = key, title = title, source = source)
+			when (val genre = array.opt(i)) {
+				is JSONObject -> {
+					val title = genre.optString("name").nullIfEmpty() ?: continue
+					val key = genre.optString("slug")
+						.ifBlank { genre.opt("id")?.toString().orEmpty() }
+						.ifBlank { title.lowercase(sourceLocale).replace(' ', '-') }
+					result += MangaTag(key = key, title = title, source = source)
+				}
+
+				is String -> {
+					val title = genre.trim().nullIfEmpty() ?: continue
+					result += MangaTag(key = title, title = title.toTitleCase(sourceLocale), source = source)
+				}
+			}
 		}
 		return result
 	}
@@ -357,8 +376,10 @@ internal class StoneScape(context: MangaLoaderContext) :
 
 	private fun parseDate(value: String?): Long {
 		if (value.isNullOrBlank()) return 0L
-		return synchronized(isoDateFormat) {
-			isoDateFormat.parseSafe(value)
+		return synchronized(dateFormats) {
+			dateFormats.firstNotNullOfOrNull { format ->
+				runCatching { format.parseSafe(value) }.getOrNull()?.takeIf { it != 0L }
+			} ?: 0L
 		}
 	}
 
@@ -371,8 +392,11 @@ internal class StoneScape(context: MangaLoaderContext) :
 	}
 
 	private companion object {
-		private val isoDateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
-			timeZone = TimeZone.getTimeZone("UTC")
+		private val dateFormats = listOf(
+			SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US),
+			SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSSSSSXXX", Locale.US),
+		).onEach {
+			it.timeZone = TimeZone.getTimeZone("UTC")
 		}
 	}
 }
