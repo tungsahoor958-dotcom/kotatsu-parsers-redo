@@ -53,6 +53,8 @@ import javax.net.ssl.SSLSocketFactory
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 import kotlin.math.min
+import okhttp3.Protocol
+import okhttp3.Response
 
 private const val PIECE_SIZE = 200
 private const val MIN_SPLIT_COUNT = 5
@@ -63,6 +65,12 @@ internal abstract class MangaFireParser(
     source: MangaParserSource,
     private val siteLang: String,
 ) : PagedMangaParser(context, source, 30), Interceptor, MangaParserAuthProvider {
+
+    private val imageHttp11Client by lazy {
+        context.httpClient.newBuilder()
+            .protocols(listOf(Protocol.HTTP_1_1))
+            .build()
+    }
 
     private val client: WebClient by lazy {
         val newHttpClient = context.httpClient.newBuilder()
@@ -151,6 +159,61 @@ internal abstract class MangaFireParser(
         val body = client.httpGet("https://${domain}/user/profile").parseHtml().body()
         return body.selectFirst("form.ajax input[name*=username]")?.attr("value")
             ?: body.parseFailed("Cannot find username")
+    }
+
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val newRequest = request.newBuilder()
+            .addHeader("Referer", "https://$domain/")
+            .build()
+
+        val response = if (request.url.host.contains("mfcdn")) {
+            imageHttp11Client.newCall(newRequest).execute()
+        } else {
+            chain.proceed(newRequest)
+        }
+
+        if (request.url.fragment?.startsWith("scrambled") == true) {
+            return context.redrawImageResponse(response) { bitmap ->
+                val offset = request.url.fragment!!.substringAfter("_").toInt()
+                val width = bitmap.width
+                val height = bitmap.height
+
+                val result = context.createBitmap(width, height)
+
+                val pieceWidth = min(PIECE_SIZE, width.ceilDiv(MIN_SPLIT_COUNT))
+                val pieceHeight = min(PIECE_SIZE, height.ceilDiv(MIN_SPLIT_COUNT))
+                val xMax = width.ceilDiv(pieceWidth) - 1
+                val yMax = height.ceilDiv(pieceHeight) - 1
+
+                for (y in 0..yMax) {
+                    for (x in 0..xMax) {
+                        val xDst = pieceWidth * x
+                        val yDst = pieceHeight * y
+                        val w = min(pieceWidth, width - xDst)
+                        val h = min(pieceHeight, height - yDst)
+
+                        val xSrc = pieceWidth * when (x) {
+                            xMax -> x
+                            else -> (xMax - x + offset) % xMax
+                        }
+                        val ySrc = pieceHeight * when (y) {
+                            yMax -> y
+                            else -> (yMax - y + offset) % yMax
+                        }
+
+                        val srcRect = Rect(xSrc, ySrc, xSrc + w, ySrc + h)
+                        val dstRect = Rect(xDst, yDst, xDst + w, yDst + h)
+
+                        result.drawBitmap(bitmap, srcRect, dstRect)
+                    }
+                }
+
+                result
+            }
+        }
+
+        return response
     }
 
     private val tags = suspendLazy(soft = true) {
