@@ -19,7 +19,7 @@ internal class ElderManga(context: MangaLoaderContext):
     PagedMangaParser(context, MangaParserSource.ELDERMANGA, 25) {
 
     override val configKeyDomain = ConfigKey.Domain("eldermanga.com")
-    private val cdnSuffix = "https://eldermangacdn2.efsaneler.can.re/"
+    private val cdnSuffix = "https://eldermangacdn2.efsaneler.can.re"
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
@@ -178,7 +178,7 @@ internal class ElderManga(context: MangaLoaderContext):
             result.groups[1]?.value?.let { url ->
                 MangaPage(
                     id = generateUid(url),
-                    url = "https://$cdnSuffix/upload/series/$url",
+                    url = "${cdnSuffix.trimEnd('/')}/upload/series/$url",
                     preview = null,
                     source = source,
                 )
@@ -279,18 +279,11 @@ internal class ElderManga(context: MangaLoaderContext):
     }
 
     private fun isCloudflareChallengePage(doc: Document): Boolean {
+        if (hasValidElderContent(doc)) {
+            return false
+        }
         val title = doc.title().lowercase(Locale.ROOT)
         if (title.contains("access denied") || title.contains("just a moment")) return true
-        if (doc.selectFirst("div.cf-wrapper") != null) return true
-        if (doc.selectFirst("div[class*=cf-]") != null) return true
-        if (doc.selectFirst("script[src*=challenge-platform]") != null) return true
-        if (doc.selectFirst("iframe[src*=challenge-platform]") != null) return true
-        if (doc.selectFirst("script[src*=challenges.cloudflare.com]") != null) return true
-        if (doc.selectFirst("iframe[src*=challenges.cloudflare.com]") != null) return true
-        if (doc.selectFirst(".cf-turnstile") != null) return true
-        if (doc.selectFirst("iframe[title*=Cloudflare]") != null) return true
-        if (doc.selectFirst("input[name=cf-turnstile-response]") != null) return true
-        if (doc.selectFirst("script[src*=challenge-platform]") != null) return true
         if (doc.getElementById("challenge-error-title") != null) return true
         if (doc.getElementById("challenge-error-text") != null) return true
         if (doc.selectFirst("form[action*=__cf_chl]") != null) return true
@@ -301,13 +294,12 @@ internal class ElderManga(context: MangaLoaderContext):
         val lower = html.lowercase(Locale.ROOT)
         return lower.contains("<title>access denied") ||
             lower.contains("<title>just a moment") ||
-            lower.contains("div class=\"cf-wrapper") ||
-            lower.contains("class=\"cf-") ||
             isClassicCloudflareChallenge(lower) ||
-            lower.contains("/cdn-cgi/challenge-platform/") ||
-            lower.contains("challenges.cloudflare.com") ||
-            lower.contains("cf-turnstile") ||
-            lower.contains("turnstile") && lower.contains("cloudflare")
+            (lower.contains("/cdn-cgi/challenge-platform/") &&
+                (lower.contains("enable javascript and cookies to continue") ||
+                    lower.contains("window._cf_chl_opt"))) ||
+            lower.contains("form action=\"/cdn-cgi/challenge-platform/") ||
+            lower.contains("form action=\"/cdn-cgi/l/chk_captcha")
     }
 
     private fun isClassicCloudflareChallenge(lower: String): Boolean {
@@ -320,11 +312,8 @@ internal class ElderManga(context: MangaLoaderContext):
     private fun hasValidElderContent(doc: Document): Boolean {
         return doc.select("section[aria-label='series area'] .card").isNotEmpty() ||
             doc.select("div.list-episode a").isNotEmpty() ||
-            doc.select("a[href*='search?categories=']").isNotEmpty() ||
-            doc.select("script").any { script ->
-                val body = script.html()
-                body.contains("\\\"path\\\":\\\"") || body.contains("\"path\"")
-            }
+            doc.select("#content h1").isNotEmpty() ||
+            doc.select("a[href*='search?categories=']").isNotEmpty()
     }
 
     private companion object {
@@ -343,11 +332,8 @@ internal class ElderManga(context: MangaLoaderContext):
                     }
                     return document.querySelector('section[aria-label="series area"] .card') !== null ||
                         document.querySelector('div.list-episode a') !== null ||
-                        document.querySelector('a[href*="search?categories="]') !== null ||
-                        Array.from(document.scripts).some(script => {
-                            const text = script.textContent || '';
-                            return text.includes('\\"path\\":\\"') || text.includes('"path"');
-                        });
+                        document.querySelector('#content h1') !== null ||
+                        document.querySelector('a[href*="search?categories="]') !== null;
                 };
 
                 return new Promise(resolve => {
@@ -369,17 +355,14 @@ internal class ElderManga(context: MangaLoaderContext):
                                 lower.includes('cf-chl-opt');
                             return hasChallengeScript || hasChallengeTitle || hasChallengeText || hasChallengeForm || hasChallengeTextSignal;
                         };
-                        const isCloudflare = challengeDetected() ||
-                            document.querySelector('iframe[src*="challenge-platform"],script[src*="challenges.cloudflare.com"],iframe[src*="challenges.cloudflare.com"],.cf-turnstile,input[name="cf-turnstile-response"],iframe[title*="Cloudflare"]') !== null ||
-                            document.querySelector('div.cf-wrapper') !== null ||
-                            document.querySelector('div[class*="cf-"]') !== null ||
+                        const isCloudflare = !hasElderContent() && (challengeDetected() ||
                             title.includes('access denied') ||
                             title.includes('just a moment') ||
                             html.includes('cf-browser-verification') ||
-                            html.includes('/cdn-cgi/challenge-platform/') ||
-                            html.includes('challenges.cloudflare.com') ||
-                            html.includes('cf-turnstile') ||
-                            (html.includes('turnstile') && html.includes('cloudflare'));
+                            (html.includes('/cdn-cgi/challenge-platform/') &&
+                                (html.includes('enable javascript and cookies to continue') || html.includes('window._cf_chl_opt'))) ||
+                            html.includes('form action="/cdn-cgi/challenge-platform/') ||
+                            html.includes('form action="/cdn-cgi/l/chk_captcha'));
                         if (isCloudflare) {
                             return true;
                         }

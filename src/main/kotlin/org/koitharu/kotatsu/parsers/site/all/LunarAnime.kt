@@ -133,8 +133,12 @@ internal class LunarAnime(context: MangaLoaderContext) :
 		val data = root.optJSONObject("data")
 		val imageUrls = when {
 			data == null -> emptyList()
-			data.optString("session_data").isNotBlank() && !secretKey.isNullOrBlank() -> {
-				decryptSessionData(data.optString("session_data"), secretKey)
+			data.optString("session_data").isNotBlank() -> {
+				if (secretKey.isNullOrBlank()) {
+					emptyList()
+				} else {
+					decryptSessionData(data.optString("session_data"), secretKey)
+				}
 			}
 			data.optJSONArray("images") != null -> jsonArrayToStrings(data.optJSONArray("images"))
 			else -> {
@@ -366,19 +370,42 @@ internal class LunarAnime(context: MangaLoaderContext) :
 
 	private suspend fun fetchSecretKey(url: String): String? {
 		val html = webClient.httpGet(url, getRequestHeaders()).parseRaw()
-		return SECRET_KEY_REGEX.find(html)?.groupValues?.getOrNull(1)
+		return SECRET_KEY_REGEXES.firstNotNullOfOrNull { regex ->
+			regex.find(html)?.groupValues?.getOrNull(1)?.nullIfEmpty()
+		}
 	}
 
 	private fun decryptSessionData(sessionData: String, secretKey: String): List<String> {
 		val decrypted = runCatching {
 			CryptoAES(context).decrypt(sessionData, secretKey.sha256(), ByteArray(16))
 		}.getOrNull() ?: return emptyList()
-		val root = runCatching { JSONObject(decrypted) }.getOrNull() ?: return emptyList()
-		return jsonArrayToStrings(
-			root.optJSONObject("data")?.optJSONArray("images")
-				?: root.optJSONArray("images")
-				?: root.optJSONArray("chapter_images"),
-		)
+		val normalized = decrypted
+			.trim()
+			.trim('\u0000')
+			.replace("\\/", "/")
+		parseDecryptedPayload(normalized)?.let { payload ->
+			return jsonArrayToStrings(
+				payload.optJSONObject("data")?.optJSONArray("images")
+					?: payload.optJSONArray("images")
+					?: payload.optJSONArray("chapter_images"),
+			)
+		}
+		return DECRYPTED_IMAGE_URL_REGEX.findAll(normalized)
+			.map { it.value }
+			.toList()
+	}
+
+	private fun parseDecryptedPayload(payload: String): JSONObject? {
+		runCatching { JSONObject(payload) }.getOrNull()?.let { return it }
+		if (payload.startsWith("\"") && payload.endsWith("\"")) {
+			val unwrapped = runCatching {
+				JSONArray("[${payload}]").getString(0)
+			}.getOrNull()?.replace("\\/", "/")
+			if (!unwrapped.isNullOrBlank()) {
+				runCatching { JSONObject(unwrapped) }.getOrNull()?.let { return it }
+			}
+		}
+		return null
 	}
 
 	private fun parseStringArray(raw: String?): List<String> {
@@ -471,7 +498,12 @@ internal class LunarAnime(context: MangaLoaderContext) :
 	private companion object {
 		private const val apiBaseUrl = "https://api.lunaranime.ru"
 		private const val CDN_HOST = "storage.lunaranime.ru"
-		private val SECRET_KEY_REGEX = Regex("\"secretKey\":\"([^\"]+)\"")
+		private val SECRET_KEY_REGEXES = listOf(
+			Regex("\"secretKey\":\"([^\"]+)\""),
+			Regex("\\\\\"secretKey\\\\\":\\\\\"([^\\\\\"]+)\\\\\""),
+			Regex("""secretKey["']?\s*:\s*["']([^"']+)["']"""),
+		)
+		private val DECRYPTED_IMAGE_URL_REGEX = Regex("""https://storage\.lunaranime\.ru/[^\s"\\]+""")
 		private val dateFormats = listOf(
 			SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", Locale.US),
 			SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US),

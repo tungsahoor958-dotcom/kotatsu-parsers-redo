@@ -212,7 +212,9 @@ internal abstract class UzayMangaParser(
 		}
 
 		val doc = loadSiteDocument(url)
-		return doc.select("section[aria-label='series area'] .card").mapNotNull(::parseSearchCard)
+		return extractDirectoryCards(doc)
+			.mapNotNull(::parseSearchCard)
+			.distinctBy { it.url }
 	}
 
 	private suspend fun getLatestPage(page: Int): List<Manga> {
@@ -275,21 +277,46 @@ internal abstract class UzayMangaParser(
 	}
 
 	private fun parseSearchCard(card: Element): Manga? {
-		val href = card.selectFirst("a")?.attrAsRelativeUrl("href") ?: return null
+		val link = when {
+			card.normalName() == "a" && card.hasAttr("href") -> card
+			else -> card.selectFirst("a[href*='/manga/']") ?: card.selectFirst("a")
+		} ?: return null
+		val href = link.attrAsRelativeUrl("href")
+		val title = card.selectFirst("h2")?.textOrNull()
+			?: link.selectFirst("h2")?.textOrNull()
+			?: link.attr("title").nullIfEmpty()
+			?: return null
 		return Manga(
 			id = generateUid(href),
-			title = card.selectFirst("h2")?.text().orEmpty(),
+			title = title,
 			altTitles = emptySet(),
 			url = href,
 			publicUrl = href.toAbsoluteUrl(domain),
 			rating = RATING_UNKNOWN,
 			contentRating = null,
-			coverUrl = card.selectFirst("img")?.attrAsAbsoluteUrlOrNull("src"),
+			coverUrl = card.selectFirst("img")?.attrAsAbsoluteUrlOrNull("src")
+				?: link.selectFirst("img")?.attrAsAbsoluteUrlOrNull("src"),
 			tags = emptySet(),
 			state = null,
 			authors = emptySet(),
 			source = source,
 		)
+	}
+
+	private fun extractDirectoryCards(doc: Document): List<Element> {
+		val section = doc.selectFirst("section[aria-label='series area']") ?: return emptyList()
+		val cards = section.select(".card").ifEmpty {
+			section.select("a[href*='/manga/']").filter { element ->
+				element.selectFirst("h2, img") != null
+			}
+		}
+		return cards.filterNot { element ->
+			val href = when {
+				element.normalName() == "a" -> element.attr("href")
+				else -> element.selectFirst("a")?.attr("href").orEmpty()
+			}
+			href.contains("/chapter/") || href.contains("/bolum/")
+		}
 	}
 
 	private fun parseLatestCard(card: Element): Manga? {
@@ -510,20 +537,14 @@ internal abstract class UzayMangaParser(
 	}
 
 	private fun isCloudflareChallengePage(doc: Document): Boolean {
+		if (hasValidUzayContent(doc)) {
+			return false
+		}
 		val title = doc.title().lowercase(Locale.ROOT)
 		if (title.contains("access denied") || title.contains("just a moment")) return true
-		if (doc.selectFirst("div.cf-wrapper") != null) return true
-		if (doc.selectFirst("div[class*=cf-]") != null) return true
-		if (doc.selectFirst("script[src*=challenge-platform]") != null) return true
-		if (doc.selectFirst("iframe[src*=challenge-platform]") != null) return true
-		if (doc.selectFirst("script[src*=challenges.cloudflare.com]") != null) return true
-		if (doc.selectFirst("iframe[src*=challenges.cloudflare.com]") != null) return true
-		if (doc.selectFirst(".cf-turnstile") != null) return true
-		if (doc.selectFirst("iframe[title*=Cloudflare]") != null) return true
-		if (doc.selectFirst("input[name=cf-turnstile-response]") != null) return true
+		if (doc.selectFirst("form[action*=__cf_chl]") != null) return true
 		if (doc.getElementById("challenge-error-title") != null) return true
 		if (doc.getElementById("challenge-error-text") != null) return true
-		if (doc.selectFirst("form[action*=__cf_chl]") != null) return true
 		return isCloudflareChallengePage(doc.outerHtml())
 	}
 
@@ -531,13 +552,12 @@ internal abstract class UzayMangaParser(
 		val lower = html.lowercase(Locale.ROOT)
 		return lower.contains("<title>access denied") ||
 			lower.contains("<title>just a moment") ||
-			lower.contains("div class=\"cf-wrapper") ||
-			lower.contains("class=\"cf-") ||
 			isClassicCloudflareChallenge(lower) ||
-			lower.contains("/cdn-cgi/challenge-platform/") ||
-			lower.contains("challenges.cloudflare.com") ||
-			lower.contains("cf-turnstile") ||
-			lower.contains("turnstile") && lower.contains("cloudflare")
+			(lower.contains("/cdn-cgi/challenge-platform/") &&
+				(lower.contains("enable javascript and cookies to continue") ||
+					lower.contains("window._cf_chl_opt"))) ||
+			lower.contains("form action=\"/cdn-cgi/challenge-platform/") ||
+			lower.contains("form action=\"/cdn-cgi/l/chk_captcha")
 	}
 
 	private fun isClassicCloudflareChallenge(lower: String): Boolean {
@@ -548,14 +568,10 @@ internal abstract class UzayMangaParser(
 	}
 
 	private fun hasValidUzayContent(doc: Document): Boolean {
-		return doc.select("section[aria-label='series area'] .card").isNotEmpty() ||
+		return extractDirectoryCards(doc).isNotEmpty() ||
 			doc.select("div.list-episode a").isNotEmpty() ||
 			doc.select("#content h1").isNotEmpty() ||
-			doc.select("a[href*='search?categories=']").isNotEmpty() ||
-			doc.select("script").any { script ->
-				val body = script.html()
-				body.contains("\\\"path\\\":\\\"") || body.contains("\"path\"")
-			}
+			doc.select("a[href*='search?categories=']").isNotEmpty()
 	}
 
 	private companion object {
@@ -576,13 +592,10 @@ internal abstract class UzayMangaParser(
 						return false;
 					}
 					return document.querySelector('section[aria-label="series area"] .card') !== null ||
+						document.querySelector('section[aria-label="series area"] a[href*="/manga/"] h2') !== null ||
 						document.querySelector('div.list-episode a') !== null ||
 						document.querySelector('#content h1') !== null ||
-						document.querySelector('a[href*="search?categories="]') !== null ||
-						Array.from(document.scripts).some(script => {
-							const text = script.textContent || '';
-							return text.includes('\\"path\\":\\"') || text.includes('"path"');
-						});
+						document.querySelector('a[href*="search?categories="]') !== null;
 				};
 
 				return new Promise(resolve => {
@@ -604,17 +617,14 @@ internal abstract class UzayMangaParser(
 								lower.includes('cf-chl-opt');
 							return hasChallengeScript || hasChallengeTitle || hasChallengeText || hasChallengeForm || hasChallengeTextSignal;
 						};
-						const isCloudflare = challengeDetected() ||
-							document.querySelector('iframe[src*="challenge-platform"],script[src*="challenges.cloudflare.com"],iframe[src*="challenges.cloudflare.com"],.cf-turnstile,input[name="cf-turnstile-response"],iframe[title*="Cloudflare"]') !== null ||
-							document.querySelector('div.cf-wrapper') !== null ||
-							document.querySelector('div[class*="cf-"]') !== null ||
+						const isCloudflare = !hasUzayContent() && (challengeDetected() ||
 							title.includes('access denied') ||
 							title.includes('just a moment') ||
 							html.includes('cf-browser-verification') ||
-							html.includes('/cdn-cgi/challenge-platform/') ||
-							html.includes('challenges.cloudflare.com') ||
-							html.includes('cf-turnstile') ||
-							(html.includes('turnstile') && html.includes('cloudflare'));
+							(html.includes('/cdn-cgi/challenge-platform/') &&
+								(html.includes('enable javascript and cookies to continue') || html.includes('window._cf_chl_opt'))) ||
+							html.includes('form action="/cdn-cgi/challenge-platform/') ||
+							html.includes('form action="/cdn-cgi/l/chk_captcha'));
 						if (isCloudflare) {
 							return true;
 						}
