@@ -510,6 +510,10 @@ internal abstract class UzayMangaParser(
 	}
 
 	private fun isCloudflareChallengePage(doc: Document): Boolean {
+		val title = doc.title().lowercase(Locale.ROOT)
+		if (title.contains("access denied") || title.contains("just a moment")) return true
+		if (doc.selectFirst("div.cf-wrapper") != null) return true
+		if (doc.selectFirst("div[class*=cf-]") != null) return true
 		if (doc.selectFirst("script[src*=challenge-platform]") != null) return true
 		if (doc.selectFirst("iframe[src*=challenge-platform]") != null) return true
 		if (doc.selectFirst("script[src*=challenges.cloudflare.com]") != null) return true
@@ -525,14 +529,22 @@ internal abstract class UzayMangaParser(
 
 	private fun isCloudflareChallengePage(html: String): Boolean {
 		val lower = html.lowercase(Locale.ROOT)
-		return (lower.contains("just a moment") && lower.contains("cloudflare")) ||
-			(lower.contains("checking your browser") && lower.contains("cloudflare")) ||
-			lower.contains("cf-chl-opt") ||
-			lower.contains("cf-browser-verification") ||
+		return lower.contains("<title>access denied") ||
+			lower.contains("<title>just a moment") ||
+			lower.contains("div class=\"cf-wrapper") ||
+			lower.contains("class=\"cf-") ||
+			isClassicCloudflareChallenge(lower) ||
 			lower.contains("/cdn-cgi/challenge-platform/") ||
 			lower.contains("challenges.cloudflare.com") ||
 			lower.contains("cf-turnstile") ||
 			lower.contains("turnstile") && lower.contains("cloudflare")
+	}
+
+	private fun isClassicCloudflareChallenge(lower: String): Boolean {
+		return (lower.contains("just a moment") && lower.contains("cloudflare")) ||
+			(lower.contains("checking your browser") && lower.contains("cloudflare")) ||
+			lower.contains("cf-browser-verification") ||
+			lower.contains("cf-chl-opt")
 	}
 
 	private fun hasValidUzayContent(doc: Document): Boolean {
@@ -578,9 +590,26 @@ internal abstract class UzayMangaParser(
 
 					const isVerificationPage = () => {
 						const html = (document.documentElement ? document.documentElement.outerHTML : '').toLowerCase();
-						const isCloudflare = document.querySelector('script[src*="challenge-platform"],iframe[src*="challenge-platform"],script[src*="challenges.cloudflare.com"],iframe[src*="challenges.cloudflare.com"],.cf-turnstile,input[name="cf-turnstile-response"],iframe[title*="Cloudflare"]') !== null ||
-							((html.includes('just a moment') || html.includes('checking your browser')) && html.includes('cloudflare')) ||
-							html.includes('cf-chl-opt') ||
+						const title = (document.title || '').toLowerCase();
+						const challengeDetected = () => {
+							const hasChallengeScript = document.querySelector('script[src*="challenge-platform"]') !== null;
+							const hasChallengeTitle = document.getElementById('challenge-error-title') !== null;
+							const hasChallengeText = document.getElementById('challenge-error-text') !== null;
+							const hasChallengeForm = document.querySelector('form[action*="__cf_chl"]') !== null;
+							const root = document.documentElement;
+							const lower = ((root && root.innerText) || '').toLowerCase();
+							const hasChallengeTextSignal =
+								(lower.includes('just a moment') && lower.includes('cloudflare')) ||
+								(lower.includes('checking your browser') && lower.includes('cloudflare')) ||
+								lower.includes('cf-chl-opt');
+							return hasChallengeScript || hasChallengeTitle || hasChallengeText || hasChallengeForm || hasChallengeTextSignal;
+						};
+						const isCloudflare = challengeDetected() ||
+							document.querySelector('iframe[src*="challenge-platform"],script[src*="challenges.cloudflare.com"],iframe[src*="challenges.cloudflare.com"],.cf-turnstile,input[name="cf-turnstile-response"],iframe[title*="Cloudflare"]') !== null ||
+							document.querySelector('div.cf-wrapper') !== null ||
+							document.querySelector('div[class*="cf-"]') !== null ||
+							title.includes('access denied') ||
+							title.includes('just a moment') ||
 							html.includes('cf-browser-verification') ||
 							html.includes('/cdn-cgi/challenge-platform/') ||
 							html.includes('challenges.cloudflare.com') ||
