@@ -1,6 +1,8 @@
 package org.koitharu.kotatsu.parsers.site.all
 
 import okhttp3.Headers
+import okhttp3.Interceptor
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -34,8 +36,15 @@ internal class KemonoCrParser(context: MangaLoaderContext) :
 
     override fun getRequestHeaders(): Headers = super.getRequestHeaders()
         .newBuilder()
-        .add("Accept", "text/css")
+        .set("Accept", "text/css")
         .build()
+
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request().newBuilder()
+            .header("Accept", "text/css")
+            .build()
+        return chain.proceed(request)
+    }
 
     override val availableSortOrders: Set<SortOrder> = EnumSet.of(SortOrder.NEWEST, SortOrder.UPDATED)
 
