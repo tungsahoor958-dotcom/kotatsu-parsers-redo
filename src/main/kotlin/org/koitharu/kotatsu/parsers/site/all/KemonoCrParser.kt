@@ -5,12 +5,14 @@ import okhttp3.Interceptor
 import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.HttpStatusException
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
+import org.koitharu.kotatsu.parsers.util.json.getLongOrDefault
 import org.koitharu.kotatsu.parsers.util.json.getStringOrNull
 import org.koitharu.kotatsu.parsers.util.json.mapJSONNotNull
 import java.text.SimpleDateFormat
@@ -28,6 +30,12 @@ internal class KemonoCrParser(context: MangaLoaderContext) :
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
     }
+
+    private val modePostsTag by lazy { MangaTag(title = "Posts", key = "posts", source = source) }
+    private val modeUsersTag by lazy { MangaTag(title = "Users", key = "users", source = source) }
+
+    @Volatile
+    private var creatorsCache: List<Creator>? = null
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
@@ -51,11 +59,44 @@ internal class KemonoCrParser(context: MangaLoaderContext) :
     override val filterCapabilities: MangaListFilterCapabilities
         get() = MangaListFilterCapabilities(
             isSearchSupported = true,
+            isSearchWithFiltersSupported = true,
         )
 
-    override suspend fun getFilterOptions() = MangaListFilterOptions()
+    override suspend fun getFilterOptions() = MangaListFilterOptions(
+        availableTags = setOf(modePostsTag, modeUsersTag),
+    )
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        return when (modeFromFilter(filter)) {
+            ListMode.POSTS -> getPostsListPage(page = page, filter = filter)
+            ListMode.USERS -> getUsersListPage(page = page, order = order, filter = filter)
+        }
+    }
+
+    override suspend fun getDetails(manga: Manga): Manga {
+        PostRef.from(manga.url)?.let { postRef ->
+            return getPostDetails(manga = manga, postRef = postRef)
+        }
+        UserRef.from(manga.url)?.let { userRef ->
+            return getUserDetails(manga = manga, userRef = userRef)
+        }
+        return manga
+    }
+
+    override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+        val postRef = PostRef.from(chapter.url) ?: return emptyList()
+        val details = webClient.httpGet(postRef.toApiUrl(domain)).parseJson()
+        return extractImageUrls(details).mapIndexed { index, url ->
+            MangaPage(
+                id = generateUid("${chapter.id}:$index:$url"),
+                url = url,
+                preview = null,
+                source = source,
+            )
+        }
+    }
+
+    private suspend fun getPostsListPage(page: Int, filter: MangaListFilter): List<Manga> {
         val offset = (page - 1) * pageSize
         val url = buildString {
             append("https://")
@@ -69,11 +110,36 @@ internal class KemonoCrParser(context: MangaLoaderContext) :
         }
         val root = webClient.httpGet(url).parseJson()
         val posts = root.optJSONArray("posts") ?: JSONArray()
-        return posts.mapJSONNotNull { it.toMangaOrNull() }
+        return posts.mapJSONNotNull { it.toPostMangaOrNull() }
     }
 
-    override suspend fun getDetails(manga: Manga): Manga {
-        val postRef = PostRef.from(manga.url) ?: return manga
+    private suspend fun getUsersListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        val offset = (page - 1) * pageSize
+        val query = filter.query?.trim().orEmpty()
+
+        val sorted = getCreators()
+            .asSequence()
+            .filter { creator ->
+                query.isEmpty() ||
+                    creator.name.contains(query, ignoreCase = true) ||
+                    creator.user.contains(query, ignoreCase = true)
+            }
+            .sortedWith(
+                when (order) {
+                    SortOrder.UPDATED -> compareByDescending<Creator> { it.updated }
+                        .thenByDescending { it.indexed }
+                    else -> compareByDescending<Creator> { it.indexed }
+                        .thenByDescending { it.updated }
+                },
+            )
+            .drop(offset)
+            .take(pageSize)
+            .toList()
+
+        return sorted.map { it.toUserManga() }
+    }
+
+    private suspend fun getPostDetails(manga: Manga, postRef: PostRef): Manga {
         val details = webClient.httpGet(postRef.toApiUrl(domain)).parseJson()
         val post = details.optJSONObject("post") ?: return manga
         val creatorName = fetchCreatorName(postRef)
@@ -98,7 +164,7 @@ internal class KemonoCrParser(context: MangaLoaderContext) :
             ),
             chapters = listOf(
                 MangaChapter(
-                    id = generateUid("${postRef.service}:${postRef.user}:${postRef.postId}"),
+                    id = generateUid(postRef.toKey()),
                     title = post.getStringOrNull("title"),
                     number = 1f,
                     volume = 0,
@@ -112,24 +178,96 @@ internal class KemonoCrParser(context: MangaLoaderContext) :
         )
     }
 
-    override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        val postRef = PostRef.from(chapter.url) ?: return emptyList()
-        val details = webClient.httpGet(postRef.toApiUrl(domain)).parseJson()
-        return extractImageUrls(details).mapIndexed { index, url ->
-            MangaPage(
-                id = generateUid("${chapter.id}:$index:$url"),
-                url = url,
-                preview = null,
+    private suspend fun getUserDetails(manga: Manga, userRef: UserRef): Manga {
+        val profile = runCatchingCancellable {
+            webClient.httpGet(userRef.toProfileApiUrl(domain)).parseJson()
+        }.getOrNull()
+
+        val creatorName = profile?.getStringOrNull("name").ifNullOrEmpty { manga.title }
+        val posts = fetchAllUserPosts(userRef)
+
+        val chapters = posts.mapIndexed { index, post ->
+            val postRef = PostRef(
+                service = userRef.service,
+                user = userRef.user,
+                postId = post.postId,
+            )
+            MangaChapter(
+                id = generateUid(postRef.toKey()),
+                title = post.title.ifNullOrEmpty { "Post #${post.postId}" },
+                number = (posts.size - index).toFloat(),
+                volume = 0,
+                url = postRef.toPublicPath(),
+                scanlator = creatorName,
+                uploadDate = dateFormat.parseSafe(post.published),
+                branch = null,
                 source = source,
             )
         }
+
+        return manga.copy(
+            title = creatorName,
+            coverUrl = manga.coverUrl.ifNullOrEmpty { userRef.toIconUrl() },
+            authors = setOfNotNull(creatorName),
+            tags = setOf(
+                MangaTag(
+                    title = userRef.service.toTitleCase(),
+                    key = userRef.service,
+                    source = source,
+                ),
+            ),
+            chapters = chapters,
+        )
+    }
+
+    private suspend fun fetchAllUserPosts(userRef: UserRef): List<UserPost> {
+        val posts = ArrayList<UserPost>(pageSize)
+        var offset = 0
+        while (true) {
+            val page = try {
+                webClient.httpGet(userRef.toPostsApiUrl(domain, offset)).parseJsonArray()
+            } catch (e: HttpStatusException) {
+                if (e.statusCode == 400 && offset > 0) {
+                    break
+                }
+                throw e
+            }
+
+            if (page.length() == 0) {
+                break
+            }
+
+            posts.addAll(page.mapJSONNotNull { it.toUserPostOrNull() })
+
+            if (page.length() < pageSize) {
+                break
+            }
+            offset += pageSize
+        }
+        return posts
+    }
+
+    private suspend fun getCreators(): List<Creator> {
+        creatorsCache?.let { return it }
+        val creators = webClient.httpGet("https://$domain/api/v1/creators")
+            .parseJsonArray()
+            .mapJSONNotNull { it.toCreatorOrNull() }
+        creatorsCache = creators
+        return creators
     }
 
     private suspend fun fetchCreatorName(postRef: PostRef): String? = runCatchingCancellable {
         webClient.httpGet(postRef.toProfileApiUrl(domain)).parseJson().getStringOrNull("name")
     }.getOrNull()
 
-    private fun JSONObject.toMangaOrNull(): Manga? {
+    private fun modeFromFilter(filter: MangaListFilter): ListMode {
+        return when (filter.tags.firstOrNull()?.key) {
+            modeUsersTag.key -> ListMode.USERS
+            else -> ListMode.POSTS
+        }
+    }
+
+    private fun JSONObject.toPostMangaOrNull(): Manga? {
         val service = getStringOrNull("service") ?: return null
         val user = getStringOrNull("user") ?: return null
         val postId = getStringOrNull("id") ?: return null
@@ -149,6 +287,52 @@ internal class KemonoCrParser(context: MangaLoaderContext) :
             state = null,
             authors = emptySet(),
             source = source,
+        )
+    }
+
+    private fun JSONObject.toCreatorOrNull(): Creator? {
+        val service = getStringOrNull("service") ?: return null
+        val user = getStringOrNull("id") ?: return null
+        val name = getStringOrNull("name").ifNullOrEmpty { user }
+        return Creator(
+            service = service,
+            user = user,
+            name = name,
+            indexed = getLongOrDefault("indexed", 0L),
+            updated = getLongOrDefault("updated", 0L),
+        )
+    }
+
+    private fun Creator.toUserManga(): Manga {
+        val userRef = UserRef(service = service, user = user)
+        return Manga(
+            id = generateUid(userRef.toKey()),
+            title = name,
+            altTitles = emptySet(),
+            url = userRef.toPublicPath(),
+            publicUrl = userRef.toPublicUrl(domain),
+            rating = RATING_UNKNOWN,
+            contentRating = null,
+            coverUrl = userRef.toIconUrl(),
+            tags = setOf(
+                MangaTag(
+                    title = service.toTitleCase(),
+                    key = service,
+                    source = source,
+                ),
+            ),
+            state = null,
+            authors = setOf(name),
+            source = source,
+        )
+    }
+
+    private fun JSONObject.toUserPostOrNull(): UserPost? {
+        val postId = getStringOrNull("id") ?: return null
+        return UserPost(
+            postId = postId,
+            title = getStringOrNull("title"),
+            published = getStringOrNull("published"),
         )
     }
 
@@ -228,6 +412,56 @@ internal class KemonoCrParser(context: MangaLoaderContext) :
             normalized.endsWith(".webp") ||
             normalized.endsWith(".avif") ||
             normalized.endsWith(".bmp")
+    }
+
+    private enum class ListMode {
+        POSTS,
+        USERS,
+    }
+
+    private data class Creator(
+        val service: String,
+        val user: String,
+        val name: String,
+        val indexed: Long,
+        val updated: Long,
+    )
+
+    private data class UserPost(
+        val postId: String,
+        val title: String?,
+        val published: String?,
+    )
+
+    private data class UserRef(
+        val service: String,
+        val user: String,
+    ) {
+        fun toKey(): String = "creator:$service:$user"
+
+        fun toPublicPath(): String = "/$service/user/$user"
+
+        fun toPublicUrl(domain: String): String = "https://$domain${toPublicPath()}"
+
+        fun toProfileApiUrl(domain: String): String = "https://$domain/api/v1/$service/user/$user/profile"
+
+        fun toPostsApiUrl(domain: String, offset: Int): String {
+            return "https://$domain/api/v1/$service/user/$user/posts?o=$offset"
+        }
+
+        fun toIconUrl(): String = "https://img.kemono.cr/icons/$service/$user"
+
+        companion object {
+            private val routeRegex = Regex("""/?([^/]+)/user/([^/?#]+)/?${'$'}""")
+
+            fun from(url: String): UserRef? {
+                val match = routeRegex.find(url) ?: return null
+                return UserRef(
+                    service = match.groupValues[1],
+                    user = match.groupValues[2],
+                )
+            }
+        }
     }
 
     private data class PostRef(
