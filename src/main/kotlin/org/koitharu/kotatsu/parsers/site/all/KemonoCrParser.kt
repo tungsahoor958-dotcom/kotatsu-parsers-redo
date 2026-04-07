@@ -225,7 +225,6 @@ internal class KemonoCrParser(context: MangaLoaderContext) :
         return normalized.endsWith(".jpg") ||
             normalized.endsWith(".jpeg") ||
             normalized.endsWith(".png") ||
-            normalized.endsWith(".gif") ||
             normalized.endsWith(".webp") ||
             normalized.endsWith(".avif") ||
             normalized.endsWith(".bmp")
