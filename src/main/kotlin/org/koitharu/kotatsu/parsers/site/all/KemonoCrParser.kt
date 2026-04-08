@@ -17,7 +17,6 @@ import org.koitharu.kotatsu.parsers.util.json.getStringOrNull
 import org.koitharu.kotatsu.parsers.util.json.mapJSONNotNull
 import java.text.SimpleDateFormat
 import java.util.EnumSet
-import java.util.LinkedHashSet
 import java.util.Locale
 import java.util.TimeZone
 
@@ -352,51 +351,71 @@ internal class KemonoCrParser(context: MangaLoaderContext) :
     }
 
     private fun extractImageUrls(details: JSONObject): List<String> {
-        val urls = LinkedHashSet<String>()
-        details.optJSONObject("post")?.let { post ->
-            addImagePath(urls, post.optJSONObject("file")?.getStringOrNull("path"), null)
-            val postAttachments = post.optJSONArray("attachments")
-            if (postAttachments != null) {
-                for (i in 0 until postAttachments.length()) {
-                    val jo = postAttachments.optJSONObject(i) ?: continue
-                    addImagePath(urls, jo.getStringOrNull("path"), null)
-                }
-            }
-        }
+        // Keep unique image path entries and prefer direct media-server URLs over domain redirects.
+        val urlsByPath = linkedMapOf<String, String>()
+
         details.optJSONArray("attachments")?.let { attachments ->
             for (i in 0 until attachments.length()) {
                 val jo = attachments.optJSONObject(i) ?: continue
                 addImagePath(
-                    urls = urls,
+                    urlsByPath = urlsByPath,
                     path = jo.getStringOrNull("path"),
                     server = jo.getStringOrNull("server"),
                 )
             }
         }
-        details.optJSONArray("previews")?.let { previews ->
-            for (i in 0 until previews.length()) {
-                val jo = previews.optJSONObject(i) ?: continue
-                addImagePath(
-                    urls = urls,
-                    path = jo.getStringOrNull("path"),
-                    server = jo.getStringOrNull("server"),
-                )
+
+        details.optJSONObject("post")?.let { post ->
+            addImagePath(urlsByPath, post.optJSONObject("file")?.getStringOrNull("path"), null)
+            val postAttachments = post.optJSONArray("attachments")
+            if (postAttachments != null) {
+                for (i in 0 until postAttachments.length()) {
+                    val jo = postAttachments.optJSONObject(i) ?: continue
+                    addImagePath(urlsByPath, jo.getStringOrNull("path"), null)
+                }
             }
         }
-        return urls.toList()
+
+        // Preview entries are usually duplicates/thumbnails; use only as fallback when no full images exist.
+        if (urlsByPath.isEmpty()) {
+            details.optJSONArray("previews")?.let { previews ->
+                for (i in 0 until previews.length()) {
+                    val jo = previews.optJSONObject(i) ?: continue
+                    addImagePath(
+                        urlsByPath = urlsByPath,
+                        path = jo.getStringOrNull("path"),
+                        server = jo.getStringOrNull("server"),
+                    )
+                }
+            }
+        }
+
+        return urlsByPath.values.toList()
     }
 
-    private fun addImagePath(urls: LinkedHashSet<String>, path: String?, server: String?) {
+    private fun addImagePath(urlsByPath: MutableMap<String, String>, path: String?, server: String?) {
         if (path.isNullOrEmpty() || !isImagePath(path)) {
             return
         }
         val normalizedPath = if (path.startsWith('/')) path else "/$path"
+        val pathKey = normalizedPath.substringBefore('?').substringBefore('#').lowercase(Locale.ROOT)
+
         val fullUrl = if (!server.isNullOrEmpty()) {
             "${server.removeSuffix('/')}/data$normalizedPath"
         } else {
             normalizedPath.toDataUrl()
         }
-        urls.add(fullUrl)
+
+        val existing = urlsByPath[pathKey]
+        if (existing == null) {
+            urlsByPath[pathKey] = fullUrl
+            return
+        }
+
+        // Replace slower domain redirect URLs with direct media-server URLs when available.
+        if (!server.isNullOrEmpty() && existing.startsWith("https://$domain/data")) {
+            urlsByPath[pathKey] = fullUrl
+        }
     }
 
     private fun String.toDataUrl(): String {
